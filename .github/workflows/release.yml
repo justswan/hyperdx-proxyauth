@@ -14,6 +14,11 @@ permissions:
 env:
   GH_TOKEN: ${{ github.token }}
 
+# explicit shell adds -o pipefail; the implicit default is plain `bash -e`
+defaults:
+  run:
+    shell: bash
+
 jobs:
   check:
     runs-on: ubuntu-latest
