@@ -56,9 +56,11 @@ jobs:
     env:
       VERSION: ${{ needs.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - name: checkout this repo (proxy-auth.patch)
+        uses: actions/checkout@v7
 
-      - uses: actions/checkout@v4
+      - name: checkout upstream HyperDX
+        uses: actions/checkout@v7
         with:
           repository: hyperdxio/hyperdx
           ref: refs/tags/@hyperdx/app@${{ needs.check.outputs.version }}
