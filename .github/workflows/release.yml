@@ -49,6 +49,22 @@ jobs:
             echo "released=false" | tee -a "$GITHUB_OUTPUT"
           fi
 
+      - name: summary
+        env:
+          VERSION: ${{ steps.upstream.outputs.version }}
+          RELEASED: ${{ steps.ours.outputs.released }}
+          BLOCKED: ${{ steps.broken.outputs.blocked }}
+        run: |
+          if [ "$BLOCKED" = true ]; then action="paused: open \`broken\` issue, fix the patch and run manually"
+          elif [ "$RELEASED" = true ]; then action="nothing to do: already released"
+          else action="apply, build and release \`$VERSION\`"
+          fi
+          {
+            echo "| latest upstream | released here | action |"
+            echo "|---|---|---|"
+            echo "| \`$VERSION\` | $RELEASED | $action |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   release:
     needs: check
     if: needs.check.outputs.released == 'false' && needs.check.outputs.blocked == 'false'
