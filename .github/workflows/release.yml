@@ -1,0 +1,107 @@
+name: release
+
+# Daily: apply proxy-auth.patch to the latest upstream HyperDX release; if it builds, publish a release with the same version.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.upstream.outputs.version }}
+      released: ${{ steps.ours.outputs.released }}
+      blocked: ${{ steps.broken.outputs.blocked }}
+    steps:
+      - name: patch marked broken?
+        id: broken
+        # scheduled runs stop while a `broken` issue is open; a manual run always tries
+        run: |
+          open=$(gh issue list -R "$GITHUB_REPOSITORY" --label broken --state open --json number -q length)
+          if [ "${{ github.event_name }}" = schedule ] && [ "$open" -gt 0 ]; then
+            echo "blocked=true" | tee -a "$GITHUB_OUTPUT"
+          else
+            echo "blocked=false" | tee -a "$GITHUB_OUTPUT"
+          fi
+
+      - name: latest upstream release
+        id: upstream
+        run: |
+          tag=$(gh release list -R hyperdxio/hyperdx --exclude-pre-releases -L 50 --json tagName \
+            -q '[.[] | select(.tagName | startswith("@hyperdx/app@"))][0].tagName')
+          echo "version=${tag#@hyperdx/app@}" | tee -a "$GITHUB_OUTPUT"
+
+      - name: already released here?
+        id: ours
+        run: |
+          if gh release view "${{ steps.upstream.outputs.version }}" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "released=true" | tee -a "$GITHUB_OUTPUT"
+          else
+            echo "released=false" | tee -a "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: check
+    if: needs.check.outputs.released == 'false' && needs.check.outputs.blocked == 'false'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: hyperdxio/hyperdx
+          ref: refs/tags/@hyperdx/app@${{ needs.check.outputs.version }}
+          path: hyperdx
+
+      - name: apply patch
+        # strict: any context mismatch fails the run instead of fuzzing auth code into place
+        run: git -C hyperdx apply --verbose ../proxy-auth.patch
+
+      - name: build (no push)
+        working-directory: hyperdx
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: |
+          docker build . \
+            -f docker/hyperdx/Dockerfile \
+            --target prod \
+            --build-context hyperdx=./docker/hyperdx \
+            --build-context api=./packages/api \
+            --build-context app=./packages/app \
+            --tag hyperdx-proxyauth:"$VERSION"
+
+      - name: publish release
+        run: |
+          gh release create "$VERSION" proxy-auth.patch \
+            --title "$VERSION" \
+            --notes "proxy-auth.patch applies to and builds on upstream [@hyperdx/app@$VERSION](https://github.com/hyperdxio/hyperdx/releases/tag/%40hyperdx%2Fapp%40$VERSION)."
+
+      - name: close broken issues
+        run: |
+          for n in $(gh issue list -R "$GITHUB_REPOSITORY" --label broken --state open --json number -q '.[].number'); do
+            gh issue close "$n" -R "$GITHUB_REPOSITORY" --comment "Fixed: released $VERSION."
+          done
+
+      - name: report broken patch
+        if: failure()
+        run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          n=$(gh issue list -R "$GITHUB_REPOSITORY" --label broken --state open --json number -q '.[0].number')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" -R "$GITHUB_REPOSITORY" --body "Still failing on $VERSION: $run_url"
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --label broken \
+              --title "proxy-auth.patch fails on $VERSION" \
+              --body "Run: $run_url"
+          fi

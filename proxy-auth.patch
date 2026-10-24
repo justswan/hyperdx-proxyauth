@@ -1,0 +1,156 @@
+From 1297a7f4e6e730bab37f1acb5ce7e46a35b7a721 Mon Sep 17 00:00:00 2001
+From: Anatoly Lebedev <swan@justswan.org>
+Date: Tue, 23 Jun 2026 00:42:16 +0200
+Subject: [PATCH] auth: trust upstream proxy email header
+ (AUTH_PROXY_EMAIL_HEADERS) + resolve team by AUTH_PROXY_TEAM_NAME
+
+---
+ packages/api/src/config.ts           | 15 +++++++++++
+ packages/api/src/controllers/team.ts |  4 +++
+ packages/api/src/controllers/user.ts | 23 +++++++++++++++++
+ packages/api/src/middleware/auth.ts  | 38 +++++++++++++++++++++++++++-
+ 4 files changed, 79 insertions(+), 1 deletion(-)
+
+diff --git a/packages/api/src/config.ts b/packages/api/src/config.ts
+index 9ac7104ac..492e61799 100644
+--- a/packages/api/src/config.ts
++++ b/packages/api/src/config.ts
+@@ -65,6 +65,21 @@ export const RUN_SCHEDULED_TASKS_EXTERNALLY =
+ // utils/tokenEncryption.ts.
+ export const TOKEN_ENCRYPTION_KEY = env.TOKEN_ENCRYPTION_KEY;
+ 
++// Proxy/SSO auth: trust an email header set by an upstream authenticating proxy
++// (e.g. Cloudflare Access / authentik forward-auth). Comma-separated list of
++// header names tried in order; first non-empty value identifies the user.
++// Empty list (default) disables proxy auth. SECURITY: only safe when HyperDX is
++// reachable exclusively through the proxy and the proxy overwrites these headers.
++export const AUTH_PROXY_EMAIL_HEADERS = (
++  (env.AUTH_PROXY_EMAIL_HEADERS as string) || ''
++)
++  .split(',')
++  .map(h => h.trim().toLowerCase())
++  .filter(Boolean);
++// Team (by name) that proxy-authenticated users are attached to and that getTeam
++// resolves to. Leave unset to fall back to the single team (Team.findOne).
++export const AUTH_PROXY_TEAM_NAME = env.AUTH_PROXY_TEAM_NAME as string | undefined;
++
+ // Only used to bootstrap empty instances
+ export const DEFAULT_CONNECTIONS = env.DEFAULT_CONNECTIONS;
+ export const DEFAULT_SOURCES = env.DEFAULT_SOURCES;
+diff --git a/packages/api/src/controllers/team.ts b/packages/api/src/controllers/team.ts
+index 6fd5bba1d..84e5316bd 100644
+--- a/packages/api/src/controllers/team.ts
++++ b/packages/api/src/controllers/team.ts
+@@ -82,6 +82,10 @@ export function getTeam(id: string | ObjectId, fields?: readonly string[]) {
+     return LOCAL_APP_TEAM as any;
+   }
+ 
++  if (config.AUTH_PROXY_TEAM_NAME) {
++    return Team.findOne({ name: config.AUTH_PROXY_TEAM_NAME }, fields);
++  }
++
+   return Team.findOne({}, fields);
+ }
+ 
+diff --git a/packages/api/src/controllers/user.ts b/packages/api/src/controllers/user.ts
+index 7c80b782b..c0881da41 100644
+--- a/packages/api/src/controllers/user.ts
++++ b/packages/api/src/controllers/user.ts
+@@ -3,8 +3,10 @@ import { isPersistableUserId as isPersistableUserIdHex } from '@hyperdx/common-u
+ import mongoose from 'mongoose';
+ import { v4 as uuidv4 } from 'uuid';
+ 
++import * as config from '@/config';
+ import type { ObjectId } from '@/models';
+ import Alert from '@/models/alert';
++import Team from '@/models/team';
+ import User from '@/models/user';
+ import logger from '@/utils/logger';
+ export function findUserByAccessKey(accessKey: string) {
+@@ -31,6 +33,27 @@ export function findUserByEmail(email: string) {
+   return User.findOne({ email: email.toLowerCase() });
+ }
+ 
++// Resolve (or lazily create) a user identified by a trusted upstream proxy
++// (see AUTH_PROXY_EMAIL_HEADERS). New users are attached to AUTH_PROXY_TEAM_NAME
++// (or the single existing team). Returns null when no target team exists.
++// Uses upsert to avoid duplicate-key races on the unique email index.
++export async function findOrCreateProxyUser(email: string) {
++  const lowerEmail = email.toLowerCase();
++  const existing = await findUserByEmail(lowerEmail);
++  if (existing) return existing;
++
++  const team = config.AUTH_PROXY_TEAM_NAME
++    ? await Team.findOne({ name: config.AUTH_PROXY_TEAM_NAME })
++    : await Team.findOne({});
++  if (!team) return null;
++
++  return User.findOneAndUpdate(
++    { email: lowerEmail },
++    { $setOnInsert: { email: lowerEmail, name: lowerEmail, team: team._id } },
++    { upsert: true, new: true, setDefaultsOnInsert: true },
++  );
++}
++
+ export function findUsersByTeam(team: string | ObjectId) {
+   return User.find({ team }).sort({ createdAt: 1 });
+ }
+diff --git a/packages/api/src/middleware/auth.ts b/packages/api/src/middleware/auth.ts
+index 5be32c979..97f559e93 100644
+--- a/packages/api/src/middleware/auth.ts
++++ b/packages/api/src/middleware/auth.ts
+@@ -4,7 +4,7 @@ import type { NextFunction, Request, Response } from 'express';
+ import { serializeError } from 'serialize-error';
+ 
+ import * as config from '@/config';
+-import { findUserByAccessKey } from '@/controllers/user';
++import { findOrCreateProxyUser, findUserByAccessKey } from '@/controllers/user';
+ import type { UserDocument } from '@/models/user';
+ import {
+   getActiveTraceId,
+@@ -154,6 +154,42 @@ export function isUserAuthenticated(
+     return nextWithQueryAttribution(req, next);
+   }
+ 
++  if (config.AUTH_PROXY_EMAIL_HEADERS.length > 0) {
++    // Trust an email header set by an upstream authenticating proxy.
++    let email: string | undefined;
++    for (const header of config.AUTH_PROXY_EMAIL_HEADERS) {
++      const raw = req.headers[header];
++      const value = (Array.isArray(raw) ? raw[0] : raw)?.trim();
++      if (value) {
++        email = value;
++        break;
++      }
++    }
++    if (!email) {
++      return res.sendStatus(401);
++    }
++    findOrCreateProxyUser(email)
++      .then(user => {
++        if (!user) {
++          logger.error({ email }, 'Proxy auth: no team to attach user to');
++          return res.sendStatus(401);
++        }
++        req.user = user;
++        setBusinessContext({
++          teamId: user.team?.toString(),
++          userId: user._id.toString(),
++          email: user.email,
++          ...getStaticFeatureFlags(),
++        });
++        nextWithQueryAttribution(req, next);
++      })
++      .catch(err => {
++        logger.error({ err: serializeError(err) }, 'Proxy auth failed');
++        res.sendStatus(401);
++      });
++    return;
++  }
++
+   if (req.isAuthenticated()) {
+     // Attach incident-remediation context to the trace and active span.
+     setBusinessContext({
+-- 
+2.55.0
+
