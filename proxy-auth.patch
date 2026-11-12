@@ -1,18 +1,18 @@
-From 1297a7f4e6e730bab37f1acb5ce7e46a35b7a721 Mon Sep 17 00:00:00 2001
+From 34ec238dec86cf0dce5ac8e616978bf4e68ac5fd Mon Sep 17 00:00:00 2001
 From: Anatoly Lebedev <swan@justswan.org>
-Date: Tue, 23 Jun 2026 00:42:16 +0200
+Date: Thu, 12 Nov 2026 09:38:10 +0100
 Subject: [PATCH] auth: trust upstream proxy email header
  (AUTH_PROXY_EMAIL_HEADERS) + resolve team by AUTH_PROXY_TEAM_NAME
 
 ---
- packages/api/src/config.ts           | 15 +++++++++++
+ packages/api/src/config.ts           | 15 ++++++++++
  packages/api/src/controllers/team.ts |  4 +++
- packages/api/src/controllers/user.ts | 23 +++++++++++++++++
- packages/api/src/middleware/auth.ts  | 38 +++++++++++++++++++++++++++-
- 4 files changed, 79 insertions(+), 1 deletion(-)
+ packages/api/src/controllers/user.ts | 23 +++++++++++++++
+ packages/api/src/middleware/auth.ts  | 42 +++++++++++++++++++++++++++-
+ 4 files changed, 83 insertions(+), 1 deletion(-)
 
 diff --git a/packages/api/src/config.ts b/packages/api/src/config.ts
-index 9ac7104ac..492e61799 100644
+index 9ac7104a..492e6179 100644
 --- a/packages/api/src/config.ts
 +++ b/packages/api/src/config.ts
 @@ -65,6 +65,21 @@ export const RUN_SCHEDULED_TASKS_EXTERNALLY =
@@ -38,7 +38,7 @@ index 9ac7104ac..492e61799 100644
  export const DEFAULT_CONNECTIONS = env.DEFAULT_CONNECTIONS;
  export const DEFAULT_SOURCES = env.DEFAULT_SOURCES;
 diff --git a/packages/api/src/controllers/team.ts b/packages/api/src/controllers/team.ts
-index 6fd5bba1d..84e5316bd 100644
+index 6fd5bba1..84e5316b 100644
 --- a/packages/api/src/controllers/team.ts
 +++ b/packages/api/src/controllers/team.ts
 @@ -82,6 +82,10 @@ export function getTeam(id: string | ObjectId, fields?: readonly string[]) {
@@ -53,10 +53,10 @@ index 6fd5bba1d..84e5316bd 100644
  }
  
 diff --git a/packages/api/src/controllers/user.ts b/packages/api/src/controllers/user.ts
-index 7c80b782b..c0881da41 100644
+index 51e8a451..0b51d2e7 100644
 --- a/packages/api/src/controllers/user.ts
 +++ b/packages/api/src/controllers/user.ts
-@@ -3,8 +3,10 @@ import { isPersistableUserId as isPersistableUserIdHex } from '@hyperdx/common-u
+@@ -5,8 +5,10 @@ import crypto from 'crypto';
  import mongoose from 'mongoose';
  import { v4 as uuidv4 } from 'uuid';
  
@@ -64,10 +64,10 @@ index 7c80b782b..c0881da41 100644
  import type { ObjectId } from '@/models';
  import Alert from '@/models/alert';
 +import Team from '@/models/team';
- import User from '@/models/user';
- import logger from '@/utils/logger';
- export function findUserByAccessKey(accessKey: string) {
-@@ -31,6 +33,27 @@ export function findUserByEmail(email: string) {
+ import User, { type IUser } from '@/models/user';
+ import { isDuplicateKeyError } from '@/utils/errors';
+ import { getCounter } from '@/utils/instrumentation';
+@@ -80,6 +82,27 @@ export function findUserByEmail(email: string) {
    return User.findOne({ email: email.toLowerCase() });
  }
  
@@ -93,22 +93,26 @@ index 7c80b782b..c0881da41 100644
 +}
 +
  export function findUsersByTeam(team: string | ObjectId) {
-   return User.find({ team }).sort({ createdAt: 1 });
+   return User.find({ team, ...NOT_VIRTUAL }).sort({ createdAt: 1 });
  }
 diff --git a/packages/api/src/middleware/auth.ts b/packages/api/src/middleware/auth.ts
-index 5be32c979..97f559e93 100644
+index f33ae6ce..c68b7168 100644
 --- a/packages/api/src/middleware/auth.ts
 +++ b/packages/api/src/middleware/auth.ts
-@@ -4,7 +4,7 @@ import type { NextFunction, Request, Response } from 'express';
- import { serializeError } from 'serialize-error';
+@@ -5,7 +5,11 @@ import { serializeError } from 'serialize-error';
  
  import * as config from '@/config';
--import { findUserByAccessKey } from '@/controllers/user';
-+import { findOrCreateProxyUser, findUserByAccessKey } from '@/controllers/user';
+ import { touchOrgApiKeyLastUsed } from '@/controllers/orgApiKey';
+-import { findUserByAccessKey, ORG_API_KEY_PREFIX } from '@/controllers/user';
++import {
++  findOrCreateProxyUser,
++  findUserByAccessKey,
++  ORG_API_KEY_PREFIX,
++} from '@/controllers/user';
  import type { UserDocument } from '@/models/user';
  import {
    getActiveTraceId,
-@@ -154,6 +154,42 @@ export function isUserAuthenticated(
+@@ -174,6 +178,42 @@ export function isUserAuthenticated(
      return nextWithQueryAttribution(req, next);
    }
  
@@ -152,5 +156,5 @@ index 5be32c979..97f559e93 100644
      // Attach incident-remediation context to the trace and active span.
      setBusinessContext({
 -- 
-2.55.0
+2.54.0 (Apple Git-157)
 
